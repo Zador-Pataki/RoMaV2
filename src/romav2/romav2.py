@@ -79,6 +79,7 @@ class RoMaV2(nn.Module):
         setting: Setting = "precise"
         compile: bool = True
         name: str = "RoMa v2"
+        use_true_highres: bool = False
 
     # settings
     H_lr: int
@@ -166,35 +167,70 @@ class RoMaV2(nn.Module):
         img_B_lr: torch.Tensor,
         img_A_hr: torch.Tensor | None = None,
         img_B_hr: torch.Tensor | None = None,
+        # NEW ARGUMENT: matches your old 'batch["corresps"]' logic
+        previous_preds: dict | None = None,
     ) -> dict[str, tuple[torch.Tensor, torch.Tensor] | torch.Tensor]:
         if torch.get_float32_matmul_precision() != "highest":
             raise RuntimeError("Float32 matmul precision must be set to highest")
         assert not self.training, "Currently only inference mode released"
-        # assumes images between [0, 1]
+
         # init preds
         predictions = OrderedDict()
-        # extract feats
-        f_A = self.f(img_A_lr)
-        f_B = self.f(img_B_lr)
-        # match feats
-        matcher_output = self.matcher(
-            f_A, f_B, img_A=img_A_lr, img_B=img_B_lr, bidirectional=self.bidirectional
-        )
-        # return matcher_output
-        predictions["matcher"] = matcher_output
-        warp_AB, confidence_AB = (
-            matcher_output["warp_AB"],
-            matcher_output["confidence_AB"],
-        )
-        if self.bidirectional:
-            warp_BA, confidence_BA = (
-                matcher_output["warp_BA"],
-                matcher_output["confidence_BA"],
+
+        # --- LOGIC CHANGE START ---
+        # If we don't have previous predictions (checkpoint), run the Coarse Matcher (DINO)
+        if previous_preds is None:
+            f_A = self.f(img_A_lr)
+            f_B = self.f(img_B_lr)
+            matcher_output = self.matcher(
+                f_A,
+                f_B,
+                img_A=img_A_lr,
+                img_B=img_B_lr,
+                bidirectional=self.bidirectional,
             )
+            predictions["matcher"] = matcher_output
+
+            # Initialize warp/confidence from the coarse matcher
+            warp_AB, confidence_AB = (
+                matcher_output["warp_AB"],
+                matcher_output["confidence_AB"],
+            )
+            if self.bidirectional:
+                warp_BA, confidence_BA = (
+                    matcher_output["warp_BA"],
+                    matcher_output["confidence_BA"],
+                )
+            else:
+                warp_BA, confidence_BA = None, None
+
+        # If we DO have previous predictions, load them (resume state)
         else:
-            warp_BA = None
-            confidence_BA = None
-        # refine warp, maybe twice (if hr is available)
+            # We assume previous_preds contains the state of the flow/warp
+            warp_AB = previous_preds["warp_AB"]
+            confidence_AB = previous_preds["confidence_AB"]
+            warp_BA = previous_preds.get("warp_BA")
+            confidence_BA = previous_preds.get("confidence_BA")
+
+            # Carry over all previous info into current predictions
+            for k, v in previous_preds.items():
+                predictions[k] = v
+        # --- LOGIC CHANGE END ---
+
+        # Coarse-only mode: skip refiner, return coarse matcher output directly
+        if getattr(self, "coarse_only", False):
+            predictions["warp_AB"] = warp_AB
+            predictions["confidence_AB"] = confidence_AB
+            if self.bidirectional:
+                predictions["warp_BA"] = warp_BA
+                predictions["confidence_BA"] = confidence_BA
+            else:
+                predictions["warp_BA"] = None
+                predictions["confidence_BA"] = None
+            return predictions
+
+        # Refine warp (VGG / Refiner stage)
+        # This continues from wherever warp_AB/confidence_AB are currently pointing
         for stage, (img_A, img_B) in enumerate(
             zip([img_A_lr, img_A_hr], [img_B_lr, img_B_hr])
         ):
@@ -299,13 +335,62 @@ class RoMaV2(nn.Module):
     @torch.inference_mode()
     def match(
         self,
-        img_like_A: ImageLike,
-        img_like_B: ImageLike,
-    ) -> dict[str, torch.Tensor]:
-        self.eval()
-        img_A = self._load_image(img_like_A)
-        img_B = self._load_image(img_like_B)
+        img_like_A: ImageLike = None,  # Made optional
+        img_like_B: ImageLike = None,  # Made optional
+        refine_batch: dict | None = None,  # Your "Checkpoint" argument
+        im_A_high_res: ImageLike = None,
+        im_B_high_res: ImageLike = None,
+        **kwargs,
+    ) -> tuple[dict[str, torch.Tensor], dict]:  # Returns (preds, cache)
+        if self.training:
+            self.eval()
 
+        # --- LOGIC CHANGE START ---
+        # 1. RESUME MODE
+        if refine_batch is not None:
+            img_A = refine_batch.get("im_A", refine_batch.get("img_A"))
+            img_B = refine_batch.get("im_B", refine_batch.get("img_B"))
+            if "corresps" in refine_batch:
+                legacy_preds = refine_batch["corresps"]
+
+                # TRANSFORM: Legacy (B,2,H,W) -> RoMaV2 (B,H,W,2)
+                warp_AB = legacy_preds["flow"]  # .permute(0, 2, 3, 1)
+
+                # INFLATE: Legacy Probability -> RoMaV2 4-Channel Confidence
+                # 1. Permute to (B, H, W, 1)
+
+
+                confidence_AB = legacy_preds["certainty"]  # .permute(0, 2, 3, 1)
+                # # 2. Inverse Sigmoid to get Logits (RoMa v2 expects logits in channel 0)
+                # logits = torch.logit(probs.clamp(1e-6, 1 - 1e-6))
+                # # 3. Add zero-initialized precision channels (Channels 1-3)
+                # B, H, W, _ = logits.shape
+                # zeros = torch.zeros(
+                #     B, H, W, 3, device=logits.device, dtype=logits.dtype
+                # )
+                # confidence_AB = torch.cat([logits, zeros], dim=-1)
+
+                previous_preds = {
+                    "warp_AB": warp_AB,
+                    "confidence_AB": confidence_AB,
+                    "warp_BA": None,
+                    "confidence_BA": None,
+                }
+            else:
+                # Fallback if you pass the raw RoMaV2 dictionary directly
+                previous_preds = refine_batch.get("preds")
+
+        # 2. FRESH START
+        else:
+            if img_like_A is None or img_like_B is None:
+                raise ValueError("If refine_batch is None, images must be provided.")
+
+            img_A = self._load_image(img_like_A)
+            img_B = self._load_image(img_like_B)
+            previous_preds = None
+        # --- LOGIC CHANGE END ---
+
+        # Prepare LR inputs
         img_A_lr = F.interpolate(
             img_A,
             size=(self.H_lr, self.W_lr),
@@ -320,53 +405,109 @@ class RoMaV2(nn.Module):
             align_corners=False,
             antialias=True,
         )
+
+        # Prepare HR inputs (if settings allow)
         if self.H_hr is not None and self.W_hr is not None:
-            img_A_hr = F.interpolate(
-                img_A,
-                size=(self.H_hr, self.W_hr),
-                mode="bicubic",
-                align_corners=False,
-                antialias=True,
-            )
-            img_B_hr = F.interpolate(
-                img_B,
-                size=(self.H_hr, self.W_hr),
-                mode="bicubic",
-                align_corners=False,
-                antialias=True,
-            )
+            if self.cfg.use_true_highres and im_A_high_res is not None:
+                img_A_hr = F.interpolate(
+                    self._load_image(im_A_high_res),
+                    size=(self.H_hr, self.W_hr),
+                    mode="bicubic",
+                    align_corners=False,
+                    antialias=True,
+                )
+            else:
+                img_A_hr = F.interpolate(
+                    img_A,
+                    size=(self.H_hr, self.W_hr),
+                    mode="bicubic",
+                    align_corners=False,
+                    antialias=True,
+                )
+            if self.cfg.use_true_highres and im_B_high_res is not None:
+                img_B_hr = F.interpolate(
+                    self._load_image(im_B_high_res),
+                    size=(self.H_hr, self.W_hr),
+                    mode="bicubic",
+                    align_corners=False,
+                    antialias=True,
+                )
+            else:
+                img_B_hr = F.interpolate(
+                    img_B,
+                    size=(self.H_hr, self.W_hr),
+                    mode="bicubic",
+                    align_corners=False,
+                    antialias=True,
+                )
         else:
             img_A_hr = None
             img_B_hr = None
 
-        preds = self(img_A_lr, img_B_lr, img_A_hr=img_A_hr, img_B_hr=img_B_hr)
-        
+        # Call forward, injecting previous_preds if we are resuming
+        preds = self(
+            img_A_lr,
+            img_B_lr,
+            img_A_hr=img_A_hr,
+            img_B_hr=img_B_hr,
+            previous_preds=previous_preds,  # Pass it down
+        )
+
+        # Standard RoMaV2 post-processing
         warp_AB = preds["warp_AB"]
         confidence_AB = preds["confidence_AB"]
         warp_BA = preds["warp_BA"]
         confidence_BA = preds["confidence_BA"]
-        overlap_AB, precision_AB = _map_confidence(
-            confidence=confidence_AB, threshold=self.threshold
-        )
-        if self.bidirectional:
-            overlap_BA, precision_BA = _map_confidence(
-                confidence=confidence_BA, threshold=self.threshold
-            )
+        if getattr(self, "coarse_only", False):
+            overlap_AB = confidence_AB[..., :1].sigmoid()
+            precision_AB = torch.zeros(*overlap_AB.shape[:-1], 2, 2, device=overlap_AB.device)
+            if self.bidirectional and confidence_BA is not None:
+                overlap_BA = confidence_BA[..., :1].sigmoid()
+                precision_BA = torch.zeros(*overlap_BA.shape[:-1], 2, 2, device=overlap_BA.device)
+            else:
+                overlap_BA = None
+                precision_BA = None
         else:
-            overlap_BA = None
-            precision_BA = None
+            overlap_AB, precision_AB = _map_confidence(
+                confidence=confidence_AB, threshold=self.threshold
+            )
+            if self.bidirectional:
+                overlap_BA, precision_BA = _map_confidence(
+                    confidence=confidence_BA, threshold=self.threshold
+                )
+            else:
+                overlap_BA = None
+                precision_BA = None
 
-        preds = {
+        final_preds = {
             "warp_AB": warp_AB.clone(),
             "confidence_AB": confidence_AB.clone(),
             "overlap_AB": overlap_AB.clone(),
             "precision_AB": precision_AB.clone(),
             "warp_BA": warp_BA.clone() if warp_BA is not None else None,
-            "confidence_BA": confidence_BA.clone() if confidence_BA is not None else None,
+            "confidence_BA": (
+                confidence_BA.clone() if confidence_BA is not None else None
+            ),
             "overlap_BA": overlap_BA.clone() if overlap_BA is not None else None,
             "precision_BA": precision_BA.clone() if precision_BA is not None else None,
         }
-        return preds
+
+        # --- CACHE CREATION ---
+        # Store everything needed to resume later in 'refine_batch' style
+        # Skip cache for coarse_only mode (keyframing doesn't need it)
+        if getattr(self, "coarse_only", False):
+            cache = {}
+        else:
+            cache = {
+                "batch": {
+                    "img_A": img_A,
+                    "img_B": img_B,
+                    "corresps": final_preds,
+                }
+            }
+
+        # Return tuple (results, cache) to match your workflow
+        return final_preds, cache
 
     def sample(self, preds: dict[str, torch.Tensor], num_corresp: int):
         warp = preds["warp_AB"]
