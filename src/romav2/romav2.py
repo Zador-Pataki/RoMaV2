@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from collections import OrderedDict
+from typing import Literal
 
 
 import numpy as np
@@ -27,6 +28,11 @@ from romav2.refiner import Refiners
 from romav2.types import Setting, ImageLike
 
 logger = logging.getLogger(__name__)
+
+_WEIGHT_URLS = {
+    "v2.0.0": "https://github.com/Parskatt/RoMaV2/releases/download/weights/romav2.pt",
+    "v2.0.1": "https://github.com/Parskatt/RoMaV2/releases/download/v2.0.1/romav2.0.1.pt",
+}
 
 
 def _interpolate_warp_and_confidence(
@@ -80,6 +86,9 @@ class RoMaV2(nn.Module):
         compile: bool = True
         name: str = "RoMa v2"
         use_true_highres: bool = False
+        version: Literal["v2.0.0", "v2.0.1"] = "v2.0.0"
+        weights_url: str | None = None
+        force_native_local_corr: bool = False
 
     # settings
     H_lr: int
@@ -95,10 +104,22 @@ class RoMaV2(nn.Module):
         if cfg is None:
             # default
             cfg = RoMaV2.Cfg()
-            
-        weights = torch.hub.load_state_dict_from_url(
-            "https://github.com/Parskatt/RoMaV2/releases/download/weights/romav2.pt"
+        if cfg.version not in _WEIGHT_URLS:
+            raise ValueError(f"Unknown RoMaV2 version: {cfg.version}")
+
+        cfg = replace(
+            cfg,
+            refiners=replace(
+                cfg.refiners,
+                local_corr_mode=cfg.version,
+                force_native_local_corr=cfg.force_native_local_corr,
+            ),
         )
+        weights_url = cfg.weights_url or _WEIGHT_URLS[cfg.version]
+        if cfg.version == "v2.0.0" and cfg.weights_url is None:
+            weights = torch.hub.load_state_dict_from_url(weights_url)
+        else:
+            weights = torch.hub.load_state_dict_from_url(weights_url, map_location=device)
         self.f = Descriptor(cfg.descriptor)
         self.matcher = Matcher(cfg.matcher)
         self.cfg = cfg

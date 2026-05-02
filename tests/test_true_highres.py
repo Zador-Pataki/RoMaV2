@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from unittest.mock import patch, MagicMock
 from romav2.romav2 import RoMaV2
+from romav2.refiner import Refiners
 
 
 def make_solid_image(value, h, w):
@@ -73,6 +74,74 @@ def test_highres_flag():
         print(f"  use_true_highres={use_true_highres}: img_A_hr mean={mean_val:.4f} — OK")
 
     print("PASSED")
+
+
+def test_version_selects_weight_url_and_local_corr_mode(monkeypatch):
+    captured = {}
+
+    def fake_load_state_dict_from_url(url, **kwargs):
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return {}
+
+    def fake_load_state_dict(self, weights):
+        captured["weights"] = weights
+
+    monkeypatch.setattr(torch.hub, "load_state_dict_from_url", fake_load_state_dict_from_url)
+    monkeypatch.setattr(torch.nn.Module, "load_state_dict", fake_load_state_dict)
+    monkeypatch.setattr(RoMaV2, "to", lambda self, *args, **kwargs: self)
+    monkeypatch.setattr(RoMaV2, "eval", lambda self, *args, **kwargs: self)
+    monkeypatch.setattr(RoMaV2, "apply_setting", lambda self, setting: None)
+    monkeypatch.setattr("romav2.romav2.Descriptor", lambda cfg: torch.nn.Identity())
+    monkeypatch.setattr("romav2.romav2.Matcher", lambda cfg: torch.nn.Identity())
+    monkeypatch.setattr("romav2.romav2.Refiners", lambda cfg: torch.nn.ModuleDict())
+    monkeypatch.setattr("romav2.romav2.FineFeatures", lambda cfg: torch.nn.Identity())
+
+    model = RoMaV2(RoMaV2.Cfg(version="v2.0.1", force_native_local_corr=True, compile=False))
+
+    assert captured["url"].endswith("/v2.0.1/romav2.0.1.pt")
+    assert captured["kwargs"]["map_location"] is not None
+    assert model.cfg.version == "v2.0.1"
+    assert model.cfg.refiners.local_corr_mode == "v2.0.1"
+    assert model.cfg.refiners.force_native_local_corr is True
+
+
+def test_default_version_preserves_2000_weight_loading(monkeypatch):
+    captured = {}
+
+    def fake_load_state_dict_from_url(url, **kwargs):
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return {}
+
+    monkeypatch.setattr(torch.hub, "load_state_dict_from_url", fake_load_state_dict_from_url)
+    monkeypatch.setattr(torch.nn.Module, "load_state_dict", lambda self, weights: None)
+    monkeypatch.setattr(RoMaV2, "to", lambda self, *args, **kwargs: self)
+    monkeypatch.setattr(RoMaV2, "eval", lambda self, *args, **kwargs: self)
+    monkeypatch.setattr(RoMaV2, "apply_setting", lambda self, setting: None)
+    monkeypatch.setattr("romav2.romav2.Descriptor", lambda cfg: torch.nn.Identity())
+    monkeypatch.setattr("romav2.romav2.Matcher", lambda cfg: torch.nn.Identity())
+    monkeypatch.setattr("romav2.romav2.Refiners", lambda cfg: torch.nn.ModuleDict())
+    monkeypatch.setattr("romav2.romav2.FineFeatures", lambda cfg: torch.nn.Identity())
+
+    model = RoMaV2(RoMaV2.Cfg(compile=False))
+
+    assert captured["url"].endswith("/weights/romav2.pt")
+    assert captured["kwargs"] == {}
+    assert model.cfg.version == "v2.0.0"
+    assert model.cfg.refiners.local_corr_mode == "v2.0.0"
+
+
+def test_refiner_config_threads_local_corr_mode():
+    cfg = Refiners.Cfg(local_corr_mode="v2.0.1", force_native_local_corr=True)
+    refiners = Refiners(cfg)
+
+    assert refiners["4"].cfg.local_corr_mode == "v2.0.1"
+    assert refiners["2"].cfg.local_corr_mode == "v2.0.1"
+    assert refiners["1"].cfg.local_corr_mode == "v2.0.1"
+    assert refiners["4"].cfg.force_native_local_corr is True
+    assert refiners["2"].cfg.force_native_local_corr is True
+    assert refiners["1"].cfg.force_native_local_corr is True
 
 
 if __name__ == "__main__":
