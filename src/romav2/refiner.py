@@ -84,6 +84,8 @@ class ConvRefiner(nn.Module):
         channels_last: bool = False
         block_type: Literal["roma"] = "roma"
         grid_sample_mode: Literal["bilinear", "bicubic"] = "bilinear"
+        local_corr_mode: Literal["v2.0.0", "v2.0.1"] = "v2.0.0"
+        force_native_local_corr: bool = False
 
     def __init__(
         self,
@@ -169,18 +171,24 @@ class ConvRefiner(nn.Module):
         )
         # Corr in other means take a kxk grid around the predicted coordinate in other image
         f_A_bdhw = f_A.permute(0, 3, 1, 2)
-        f_B_bdhw = f_BA.permute(0, 3, 1, 2)
-        d = torch.cat((f_A_bdhw, f_B_bdhw, emb_in_displacement), dim=1)
+        f_BA_bdhw = f_BA.permute(0, 3, 1, 2)
+        d = torch.cat((f_A_bdhw, f_BA_bdhw, emb_in_displacement), dim=1)
         if self.cfg.local_corr_radius is not None:
+            if self.cfg.local_corr_mode == "v2.0.0":
+                f_B_corr_bdhw = f_BA_bdhw
+            elif self.cfg.local_corr_mode == "v2.0.1":
+                f_B_corr_bdhw = f_B.permute(0, 3, 1, 2)
+            else:
+                raise ValueError(f"Unknown RoMaV2 local-corr mode: {self.cfg.local_corr_mode}")
             local_corr = local_correlation(
                 f_A_bdhw,
-                f_B_bdhw,
+                f_B_corr_bdhw,
                 local_radius=self.cfg.local_corr_radius,
                 warp=prev_warp,
                 scale_factor=scale_factor,
+                force_native=self.cfg.force_native_local_corr,
             )
             d = torch.cat((d, local_corr), dim=1)
-        # d = torch.cat((f_A_bdhw, f_B_bdhw, emb_in_displacement, local_corr), dim=1)
         if self.cfg.channels_last:
             d = d.to(memory_format=torch.channels_last)
         z = self.block1(d)
@@ -229,12 +237,16 @@ class Refiners:
         refiner_type: RefinersType = "roma-4-pow2"
         confidence_dim: int = 4
         grid_sample_mode: Literal["bilinear", "bicubic"] = "bilinear"
+        local_corr_mode: Literal["v2.0.0", "v2.0.1"] = "v2.0.0"
+        force_native_local_corr: bool = False
 
     def __new__(cls, cfg: Cfg):
         partial_refiner_coarse = partial(
             ConvRefiner.Cfg,
             confidence_dim=cfg.confidence_dim,
             grid_sample_mode=cfg.grid_sample_mode,
+            local_corr_mode=cfg.local_corr_mode,
+            force_native_local_corr=cfg.force_native_local_corr,
         )
         match cfg.refiner_type:
             case "roma-4-pow2":

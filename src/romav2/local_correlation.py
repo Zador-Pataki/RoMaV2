@@ -86,6 +86,7 @@ def local_correlation(
     scale_factor: torch.Tensor,
     padding_mode="zeros",
     sample_mode: Literal["bilinear", "nearest"] = "bilinear",
+    force_native: bool = False,
 ):
     r = local_radius
     K = (2 * r + 1) ** 2
@@ -115,7 +116,7 @@ def local_correlation(
         .expand(1, 2 * r + 1, 2 * r + 1, 2)
         .reshape(1, K, 2)
     )
-    if local_corr is None:
+    if force_native or local_corr is None:
         corr = native_torch_local_corr(
             feature0,
             feature1,
