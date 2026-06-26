@@ -89,6 +89,7 @@ class RoMaV2(nn.Module):
         version: Literal["v2.0.0", "v2.0.1"] = "v2.0.0"
         weights_url: str | None = None
         force_native_local_corr: bool = False
+        descriptor_cache_size: int = 0
 
     # settings
     H_lr: int
@@ -127,6 +128,9 @@ class RoMaV2(nn.Module):
         self.anchor_height = cfg.anchor_height
         self.refiners = Refiners(cfg.refiners)
         self.refiner_features = FineFeatures(cfg.refiner_features)
+        self._descriptor_cache: OrderedDict[tuple, tuple[torch.Tensor, ...]] = OrderedDict()
+        self._descriptor_cache_size = int(cfg.descriptor_cache_size)
+        self._roma_compile_enabled = bool(cfg.compile)
         self.to(device)
         self.eval()
         self.apply_setting(cfg.setting)
@@ -136,6 +140,88 @@ class RoMaV2(nn.Module):
             logger.info(f"Compiling {self.name}...")
             self.compile()
         logger.info(f"{self.name} initialized.")
+
+    def clear_descriptor_cache(self):
+        self._descriptor_cache.clear()
+
+    def _descriptor_cache_key(self, key, img: torch.Tensor):
+        if key is None:
+            return None
+        height, width = img.shape[-2:]
+        return (
+            key,
+            int(height),
+            int(width),
+            str(img.device),
+            str(img.dtype),
+        )
+
+    def _get_cached_descriptor(self, cache_key):
+        if cache_key is None or self._descriptor_cache_size <= 0:
+            return None
+        cached = self._descriptor_cache.get(cache_key)
+        if cached is None:
+            return None
+        self._descriptor_cache.move_to_end(cache_key)
+        return cached
+
+    def _put_cached_descriptor(self, cache_key, features):
+        if cache_key is None or self._descriptor_cache_size <= 0:
+            return
+        self._descriptor_cache[cache_key] = tuple(feature.detach() for feature in features)
+        self._descriptor_cache.move_to_end(cache_key)
+        while len(self._descriptor_cache) > self._descriptor_cache_size:
+            self._descriptor_cache.popitem(last=False)
+
+    def _descriptor_features(self, img: torch.Tensor, keys=None) -> list[torch.Tensor]:
+        if keys is None or self._descriptor_cache_size <= 0:
+            return self.f(img)
+
+        if len(keys) != img.shape[0]:
+            raise ValueError(
+                f"feature_cache_keys length {len(keys)} does not match batch size {img.shape[0]}"
+            )
+
+        cache_keys = [self._descriptor_cache_key(key, img[i]) for i, key in enumerate(keys)]
+        per_item_features: list[tuple[torch.Tensor, ...] | None] = [
+            self._get_cached_descriptor(cache_key) for cache_key in cache_keys
+        ]
+
+        missing_by_key: OrderedDict[tuple, list[int]] = OrderedDict()
+        for i, (cache_key, cached) in enumerate(zip(cache_keys, per_item_features)):
+            if cache_key is None or cached is not None:
+                continue
+            missing_by_key.setdefault(cache_key, []).append(i)
+
+        if missing_by_key:
+            representative_indices = [indices[0] for indices in missing_by_key.values()]
+            missing_features = self.f(img[representative_indices])
+            for out_idx, (cache_key, indices) in enumerate(missing_by_key.items()):
+                features = tuple(layer[out_idx].detach() for layer in missing_features)
+                self._put_cached_descriptor(cache_key, features)
+                for original_idx in indices:
+                    per_item_features[original_idx] = features
+
+        for i, cache_key in enumerate(cache_keys):
+            if per_item_features[i] is None:
+                computed = tuple(layer[0].detach() for layer in self.f(img[i : i + 1]))
+                self._put_cached_descriptor(cache_key, computed)
+                per_item_features[i] = computed
+
+        num_layers = len(per_item_features[0])
+        return [
+            torch.stack([features[layer_idx] for features in per_item_features], dim=0)
+            for layer_idx in range(num_layers)
+        ]
+
+    def _adjacent_descriptor_features(
+        self, img_sequence_lr: torch.Tensor
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        sequence_features = self.f(img_sequence_lr)
+        return (
+            [features[:-1] for features in sequence_features],
+            [features[1:] for features in sequence_features],
+        )
 
     def apply_setting(self, setting: Setting):
         if setting in ["mega1500", "scannet1500", "wxbs", "satast"]:
@@ -190,6 +276,8 @@ class RoMaV2(nn.Module):
         img_B_hr: torch.Tensor | None = None,
         # NEW ARGUMENT: matches your old 'batch["corresps"]' logic
         previous_preds: dict | None = None,
+        descriptor_features: tuple[list[torch.Tensor], list[torch.Tensor]] | None = None,
+        adjacent_sequence_lr: torch.Tensor | None = None,
     ) -> dict[str, tuple[torch.Tensor, torch.Tensor] | torch.Tensor]:
         if torch.get_float32_matmul_precision() != "highest":
             raise RuntimeError("Float32 matmul precision must be set to highest")
@@ -201,8 +289,13 @@ class RoMaV2(nn.Module):
         # --- LOGIC CHANGE START ---
         # If we don't have previous predictions (checkpoint), run the Coarse Matcher (DINO)
         if previous_preds is None:
-            f_A = self.f(img_A_lr)
-            f_B = self.f(img_B_lr)
+            if adjacent_sequence_lr is not None:
+                f_A, f_B = self._adjacent_descriptor_features(adjacent_sequence_lr)
+            elif descriptor_features is None:
+                f_A = self.f(img_A_lr)
+                f_B = self.f(img_B_lr)
+            else:
+                f_A, f_B = descriptor_features
             matcher_output = self.matcher(
                 f_A,
                 f_B,
@@ -361,6 +454,8 @@ class RoMaV2(nn.Module):
         refine_batch: dict | None = None,  # Your "Checkpoint" argument
         im_A_high_res: ImageLike = None,
         im_B_high_res: ImageLike = None,
+        feature_cache_keys: tuple[list, list] | None = None,
+        adjacent_sequence_like: ImageLike = None,
         **kwargs,
     ) -> tuple[dict[str, torch.Tensor], dict]:  # Returns (preds, cache)
         if self.training:
@@ -403,33 +498,61 @@ class RoMaV2(nn.Module):
 
         # 2. FRESH START
         else:
-            if img_like_A is None or img_like_B is None:
+            if adjacent_sequence_like is not None:
+                img_sequence = self._load_image(adjacent_sequence_like)
+                if img_sequence.shape[0] < 2:
+                    raise ValueError("adjacent_sequence_like must contain at least two images")
+                img_A = img_sequence[:-1]
+                img_B = img_sequence[1:]
+            elif img_like_A is None or img_like_B is None:
                 raise ValueError("If refine_batch is None, images must be provided.")
-
-            img_A = self._load_image(img_like_A)
-            img_B = self._load_image(img_like_B)
+            else:
+                img_A = self._load_image(img_like_A)
+                img_B = self._load_image(img_like_B)
             previous_preds = None
         # --- LOGIC CHANGE END ---
 
         # Prepare LR inputs
-        img_A_lr = F.interpolate(
-            img_A,
-            size=(self.H_lr, self.W_lr),
-            mode="bicubic",
-            align_corners=False,
-            antialias=True,
-        )
-        img_B_lr = F.interpolate(
-            img_B,
-            size=(self.H_lr, self.W_lr),
-            mode="bicubic",
-            align_corners=False,
-            antialias=True,
-        )
+        adjacent_sequence_lr = None
+        if refine_batch is None and adjacent_sequence_like is not None:
+            adjacent_sequence_lr = F.interpolate(
+                img_sequence,
+                size=(self.H_lr, self.W_lr),
+                mode="bicubic",
+                align_corners=False,
+                antialias=True,
+            )
+            img_A_lr = adjacent_sequence_lr[:-1]
+            img_B_lr = adjacent_sequence_lr[1:]
+        else:
+            img_A_lr = F.interpolate(
+                img_A,
+                size=(self.H_lr, self.W_lr),
+                mode="bicubic",
+                align_corners=False,
+                antialias=True,
+            )
+            img_B_lr = F.interpolate(
+                img_B,
+                size=(self.H_lr, self.W_lr),
+                mode="bicubic",
+                align_corners=False,
+                antialias=True,
+            )
 
         # Prepare HR inputs (if settings allow)
         if self.H_hr is not None and self.W_hr is not None:
-            if self.cfg.use_true_highres and im_A_high_res is not None:
+            if refine_batch is None and adjacent_sequence_like is not None:
+                adjacent_sequence_hr = F.interpolate(
+                    img_sequence,
+                    size=(self.H_hr, self.W_hr),
+                    mode="bicubic",
+                    align_corners=False,
+                    antialias=True,
+                )
+                img_A_hr = adjacent_sequence_hr[:-1]
+                img_B_hr = adjacent_sequence_hr[1:]
+            elif self.cfg.use_true_highres and im_A_high_res is not None:
                 img_A_hr = F.interpolate(
                     self._load_image(im_A_high_res),
                     size=(self.H_hr, self.W_hr),
@@ -465,6 +588,14 @@ class RoMaV2(nn.Module):
             img_A_hr = None
             img_B_hr = None
 
+        descriptor_features = None
+        if previous_preds is None and feature_cache_keys is not None:
+            keys_A, keys_B = feature_cache_keys
+            descriptor_features = (
+                self._descriptor_features(img_A_lr, keys_A),
+                self._descriptor_features(img_B_lr, keys_B),
+            )
+
         # Call forward, injecting previous_preds if we are resuming
         preds = self(
             img_A_lr,
@@ -472,6 +603,8 @@ class RoMaV2(nn.Module):
             img_A_hr=img_A_hr,
             img_B_hr=img_B_hr,
             previous_preds=previous_preds,  # Pass it down
+            descriptor_features=descriptor_features,
+            adjacent_sequence_lr=adjacent_sequence_lr,
         )
 
         # Standard RoMaV2 post-processing
