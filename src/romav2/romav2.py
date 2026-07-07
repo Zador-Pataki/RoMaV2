@@ -146,6 +146,7 @@ class RoMaV2(nn.Module):
         logger.info(f"{self.name} initialized.")
 
     def _compile_entrypoints(self):
+        self.compile()
         self._run_lowres_from_features = torch.compile(self._run_lowres_from_features)
         self._run_adjacent_lowres = torch.compile(self._run_adjacent_lowres)
         self._run_pair_lowres_from_features = torch.compile(self._run_pair_lowres_from_features)
@@ -1003,15 +1004,17 @@ class RoMaV2(nn.Module):
             img_A_hr = None
             img_B_hr = None
 
-        descriptor_features = None
-        if previous_preds is None and feature_cache_keys is not None:
-            keys_A, keys_B = feature_cache_keys
-            descriptor_features = (
-                self._descriptor_features(img_A_lr, keys_A),
-                self._descriptor_features(img_B_lr, keys_B),
-            )
-
-        if previous_preds is None:
+        use_split_match_path = previous_preds is None and (
+            feature_cache_keys is not None or adjacent_sequence_lr is not None
+        )
+        if use_split_match_path:
+            descriptor_features = None
+            if feature_cache_keys is not None:
+                keys_A, keys_B = feature_cache_keys
+                descriptor_features = (
+                    self._descriptor_features(img_A_lr, keys_A),
+                    self._descriptor_features(img_B_lr, keys_B),
+                )
             if descriptor_features is None:
                 descriptor_features = (self.f(img_A_lr), self.f(img_B_lr))
             f_A, f_B = descriptor_features
@@ -1043,7 +1046,6 @@ class RoMaV2(nn.Module):
             img_A_hr=img_A_hr,
             img_B_hr=img_B_hr,
             previous_preds=previous_preds,  # Pass it down
-            descriptor_features=descriptor_features,
             adjacent_sequence_lr=adjacent_sequence_lr,
         )
 
