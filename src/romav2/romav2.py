@@ -136,10 +136,24 @@ class RoMaV2(nn.Module):
         self.apply_setting(cfg.setting)
         self.name = cfg.name
         self.load_state_dict(weights)
+        if self.bidirectional:
+            self._run_highres_refine = self._run_highres_refine_bidir
+        else:
+            self._run_highres_refine = self._run_highres_refine_unidir
         if cfg.compile:
             logger.info(f"Compiling {self.name}...")
-            self.compile()
+            self._compile_entrypoints()
         logger.info(f"{self.name} initialized.")
+
+    def _compile_entrypoints(self):
+        self._run_lowres_from_features = torch.compile(self._run_lowres_from_features)
+        self._run_adjacent_lowres = torch.compile(self._run_adjacent_lowres)
+        self._run_pair_lowres_from_features = torch.compile(self._run_pair_lowres_from_features)
+        self._run_pair_lowres_highres_from_features = torch.compile(self._run_pair_lowres_highres_from_features)
+        if self.bidirectional:
+            self._run_highres_refine = torch.compile(self._run_highres_refine_bidir)
+        else:
+            self._run_highres_refine = torch.compile(self._run_highres_refine_unidir)
 
     def clear_descriptor_cache(self):
         self._descriptor_cache.clear()
@@ -213,6 +227,390 @@ class RoMaV2(nn.Module):
             torch.stack([features[layer_idx] for features in per_item_features], dim=0)
             for layer_idx in range(num_layers)
         ]
+
+    def prefill_descriptor_cache(self, img: torch.Tensor, keys) -> None:
+        if keys is None or self._descriptor_cache_size <= 0:
+            return
+        self._descriptor_features(img, keys)
+
+    def _finalize_predictions(self, preds: dict[str, torch.Tensor]) -> dict[str, torch.Tensor | None]:
+        warp_AB = preds["warp_AB"]
+        confidence_AB = preds["confidence_AB"]
+        warp_BA = preds["warp_BA"]
+        confidence_BA = preds["confidence_BA"]
+        if getattr(self, "coarse_only", False):
+            overlap_AB = confidence_AB[..., :1].sigmoid()
+            precision_AB = torch.zeros(*overlap_AB.shape[:-1], 2, 2, device=overlap_AB.device)
+            if self.bidirectional and confidence_BA is not None:
+                overlap_BA = confidence_BA[..., :1].sigmoid()
+                precision_BA = torch.zeros(*overlap_BA.shape[:-1], 2, 2, device=overlap_BA.device)
+            else:
+                overlap_BA = None
+                precision_BA = None
+        else:
+            overlap_AB, precision_AB = _map_confidence(
+                confidence=confidence_AB, threshold=self.threshold
+            )
+            if self.bidirectional:
+                overlap_BA, precision_BA = _map_confidence(
+                    confidence=confidence_BA, threshold=self.threshold
+                )
+            else:
+                overlap_BA = None
+                precision_BA = None
+
+        return {
+            "warp_AB": warp_AB.clone(),
+            "confidence_AB": confidence_AB.clone(),
+            "overlap_AB": overlap_AB.clone(),
+            "precision_AB": precision_AB.clone(),
+            "warp_BA": warp_BA.clone() if warp_BA is not None else None,
+            "confidence_BA": (
+                confidence_BA.clone() if confidence_BA is not None else None
+            ),
+            "overlap_BA": overlap_BA.clone() if overlap_BA is not None else None,
+            "precision_BA": precision_BA.clone() if precision_BA is not None else None,
+        }
+
+    def _lowres_predictions_from_features(
+        self,
+        img_A_lr: torch.Tensor,
+        img_B_lr: torch.Tensor,
+        f_A: list[torch.Tensor],
+        f_B: list[torch.Tensor],
+    ) -> OrderedDict:
+        matcher_output = self.matcher(
+            f_A,
+            f_B,
+            img_A=img_A_lr,
+            img_B=img_B_lr,
+            bidirectional=self.bidirectional,
+        )
+        predictions = OrderedDict()
+        predictions["matcher"] = matcher_output
+        predictions["warp_AB"] = matcher_output["warp_AB"]
+        predictions["confidence_AB"] = matcher_output["confidence_AB"]
+        if self.bidirectional:
+            predictions["warp_BA"] = matcher_output["warp_BA"]
+            predictions["confidence_BA"] = matcher_output["confidence_BA"]
+        else:
+            predictions["warp_BA"] = None
+            predictions["confidence_BA"] = None
+        return predictions
+
+    def _run_lowres_from_features(
+        self,
+        img_A_lr: torch.Tensor,
+        img_B_lr: torch.Tensor,
+        f_A: list[torch.Tensor],
+        f_B: list[torch.Tensor],
+    ) -> OrderedDict:
+        return self._lowres_predictions_from_features(img_A_lr, img_B_lr, f_A, f_B)
+
+    def _run_adjacent_lowres(self, adjacent_sequence_lr: torch.Tensor) -> OrderedDict:
+        f_A, f_B = self._adjacent_descriptor_features(adjacent_sequence_lr)
+        return self._lowres_predictions_from_features(
+            adjacent_sequence_lr[:-1],
+            adjacent_sequence_lr[1:],
+            f_A,
+            f_B,
+        )
+
+    def _refine_predictions_at_resolution(
+        self,
+        predictions: OrderedDict,
+        warp_AB: torch.Tensor,
+        confidence_AB: torch.Tensor,
+        warp_BA: torch.Tensor | None,
+        confidence_BA: torch.Tensor | None,
+        img_A: torch.Tensor,
+        img_B: torch.Tensor,
+        *,
+        zero_out_patch4_precision: bool,
+    ):
+        B, C, H, W = img_A.shape
+        scale_factor = torch.tensor((W / self.anchor_width, H / self.anchor_height), device=device)
+        refiner_features_A = self.refiner_features(img_A)
+        refiner_features_B = self.refiner_features(img_B)
+        for patch_size_str, refiner in self.refiners.items():
+            patch_size = int(patch_size_str)
+            zero_out_precision = zero_out_patch4_precision and patch_size == 4
+            warp_AB, confidence_AB = _interpolate_warp_and_confidence(
+                warp=warp_AB,
+                confidence=confidence_AB,
+                H=H,
+                W=W,
+                patch_size=patch_size,
+                zero_out_precision=zero_out_precision,
+            )
+            if self.bidirectional:
+                warp_BA, confidence_BA = _interpolate_warp_and_confidence(
+                    warp=warp_BA,
+                    confidence=confidence_BA,
+                    H=H,
+                    W=W,
+                    patch_size=patch_size,
+                    zero_out_precision=zero_out_precision,
+                )
+
+            f_patch_A = refiner_features_A[patch_size]
+            f_patch_B = refiner_features_B[patch_size]
+            refiner_output_AB = refiner(
+                f_A=f_patch_A,
+                f_B=f_patch_B,
+                prev_warp=warp_AB,
+                prev_confidence=confidence_AB,
+                scale_factor=scale_factor,
+            )
+            if self.bidirectional:
+                refiner_output_BA = refiner(
+                    f_A=f_patch_B,
+                    f_B=f_patch_A,
+                    prev_warp=warp_BA,
+                    prev_confidence=confidence_BA,
+                    scale_factor=scale_factor,
+                )
+            else:
+                refiner_output_BA = None
+            predictions[f"refiner_{patch_size}_AB"] = refiner_output_AB
+            predictions[f"refiner_{patch_size}_BA"] = refiner_output_BA
+            warp_AB, confidence_AB = (
+                refiner_output_AB["warp"],
+                refiner_output_AB["confidence"],
+            )
+            if self.bidirectional:
+                warp_BA, confidence_BA = (
+                    refiner_output_BA["warp"],
+                    refiner_output_BA["confidence"],
+                )
+        return warp_AB, confidence_AB, warp_BA, confidence_BA
+
+    def _finish_predictions(
+        self,
+        predictions: OrderedDict,
+        warp_AB: torch.Tensor,
+        confidence_AB: torch.Tensor,
+        warp_BA: torch.Tensor | None,
+        confidence_BA: torch.Tensor | None,
+    ) -> OrderedDict:
+        predictions["warp_AB"] = warp_AB
+        predictions["confidence_AB"] = confidence_AB
+        if self.bidirectional:
+            predictions["warp_BA"] = warp_BA
+            predictions["confidence_BA"] = confidence_BA
+        else:
+            predictions["warp_BA"] = None
+            predictions["confidence_BA"] = None
+        return predictions
+
+    def _run_pair_lowres_from_features(
+        self,
+        img_A_lr: torch.Tensor,
+        img_B_lr: torch.Tensor,
+        f_A: list[torch.Tensor],
+        f_B: list[torch.Tensor],
+    ) -> OrderedDict:
+        predictions = self._lowres_predictions_from_features(img_A_lr, img_B_lr, f_A, f_B)
+        warp_AB = predictions["warp_AB"]
+        confidence_AB = predictions["confidence_AB"]
+        warp_BA = predictions.get("warp_BA")
+        confidence_BA = predictions.get("confidence_BA")
+        warp_AB, confidence_AB, warp_BA, confidence_BA = self._refine_predictions_at_resolution(
+            predictions,
+            warp_AB,
+            confidence_AB,
+            warp_BA,
+            confidence_BA,
+            img_A_lr,
+            img_B_lr,
+            zero_out_patch4_precision=False,
+        )
+        return self._finish_predictions(predictions, warp_AB, confidence_AB, warp_BA, confidence_BA)
+
+    def _run_pair_lowres_highres_from_features(
+        self,
+        img_A_lr: torch.Tensor,
+        img_B_lr: torch.Tensor,
+        img_A_hr: torch.Tensor,
+        img_B_hr: torch.Tensor,
+        f_A: list[torch.Tensor],
+        f_B: list[torch.Tensor],
+    ) -> OrderedDict:
+        predictions = self._lowres_predictions_from_features(img_A_lr, img_B_lr, f_A, f_B)
+        warp_AB = predictions["warp_AB"]
+        confidence_AB = predictions["confidence_AB"]
+        warp_BA = predictions.get("warp_BA")
+        confidence_BA = predictions.get("confidence_BA")
+        warp_AB, confidence_AB, warp_BA, confidence_BA = self._refine_predictions_at_resolution(
+            predictions,
+            warp_AB,
+            confidence_AB,
+            warp_BA,
+            confidence_BA,
+            img_A_lr,
+            img_B_lr,
+            zero_out_patch4_precision=False,
+        )
+        warp_AB, confidence_AB, warp_BA, confidence_BA = self._refine_predictions_at_resolution(
+            predictions,
+            warp_AB,
+            confidence_AB,
+            warp_BA,
+            confidence_BA,
+            img_A_hr,
+            img_B_hr,
+            zero_out_patch4_precision=True,
+        )
+        return self._finish_predictions(predictions, warp_AB, confidence_AB, warp_BA, confidence_BA)
+
+    @torch.inference_mode()
+    def match_lowres_batch(
+        self,
+        img_A_lr: torch.Tensor,
+        img_B_lr: torch.Tensor,
+        feature_cache_keys: tuple[list, list] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        descriptor_features = None
+        if feature_cache_keys is not None:
+            keys_A, keys_B = feature_cache_keys
+            descriptor_features = (
+                self._descriptor_features(img_A_lr, keys_A),
+                self._descriptor_features(img_B_lr, keys_B),
+            )
+        else:
+            descriptor_features = (self.f(img_A_lr), self.f(img_B_lr))
+        f_A, f_B = descriptor_features
+        return self._run_lowres_from_features(img_A_lr, img_B_lr, f_A, f_B)
+
+    @torch.inference_mode()
+    def refine_highres_from_predictions(
+        self,
+        img_A_hr: torch.Tensor,
+        img_B_hr: torch.Tensor,
+        previous_preds: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor | None]:
+        return self._run_highres_refine(
+            img_A_hr,
+            img_B_hr,
+            previous_preds["warp_AB"],
+            previous_preds["confidence_AB"],
+            previous_preds.get("warp_BA"),
+            previous_preds.get("confidence_BA"),
+        )
+
+    def _refine_highres_predictions(
+        self,
+        img_A_hr: torch.Tensor,
+        img_B_hr: torch.Tensor,
+        warp_AB: torch.Tensor,
+        confidence_AB: torch.Tensor,
+        warp_BA: torch.Tensor | None,
+        confidence_BA: torch.Tensor | None,
+    ) -> OrderedDict:
+        predictions = OrderedDict()
+
+        B, C, H, W = img_A_hr.shape
+        scale_factor = torch.tensor((W / self.anchor_width, H / self.anchor_height), device=device)
+        refiner_features_A = self.refiner_features(img_A_hr)
+        refiner_features_B = self.refiner_features(img_B_hr)
+        for patch_size_str, refiner in self.refiners.items():
+            patch_size = int(patch_size_str)
+            warp_AB, confidence_AB = _interpolate_warp_and_confidence(
+                warp=warp_AB,
+                confidence=confidence_AB,
+                H=H,
+                W=W,
+                patch_size=patch_size,
+                zero_out_precision=patch_size == 4,
+            )
+            if self.bidirectional:
+                warp_BA, confidence_BA = _interpolate_warp_and_confidence(
+                    warp=warp_BA,
+                    confidence=confidence_BA,
+                    H=H,
+                    W=W,
+                    patch_size=patch_size,
+                    zero_out_precision=patch_size == 4,
+                )
+
+            f_patch_A = refiner_features_A[patch_size]
+            f_patch_B = refiner_features_B[patch_size]
+            refiner_output_AB = refiner(
+                f_A=f_patch_A,
+                f_B=f_patch_B,
+                prev_warp=warp_AB,
+                prev_confidence=confidence_AB,
+                scale_factor=scale_factor,
+            )
+            if self.bidirectional:
+                refiner_output_BA = refiner(
+                    f_A=f_patch_B,
+                    f_B=f_patch_A,
+                    prev_warp=warp_BA,
+                    prev_confidence=confidence_BA,
+                    scale_factor=scale_factor,
+                )
+            else:
+                refiner_output_BA = None
+            predictions[f"refiner_{patch_size}_AB"] = refiner_output_AB
+            predictions[f"refiner_{patch_size}_BA"] = refiner_output_BA
+            warp_AB, confidence_AB = (
+                refiner_output_AB["warp"],
+                refiner_output_AB["confidence"],
+            )
+            if self.bidirectional:
+                warp_BA, confidence_BA = (
+                    refiner_output_BA["warp"],
+                    refiner_output_BA["confidence"],
+                )
+
+        predictions["warp_AB"] = warp_AB
+        predictions["confidence_AB"] = confidence_AB
+        if self.bidirectional:
+            predictions["warp_BA"] = warp_BA
+            predictions["confidence_BA"] = confidence_BA
+        else:
+            predictions["warp_BA"] = None
+            predictions["confidence_BA"] = None
+        return predictions
+
+    def _run_highres_refine_bidir(
+        self,
+        img_A_hr: torch.Tensor,
+        img_B_hr: torch.Tensor,
+        warp_AB: torch.Tensor,
+        confidence_AB: torch.Tensor,
+        warp_BA: torch.Tensor,
+        confidence_BA: torch.Tensor,
+    ) -> dict[str, torch.Tensor | None]:
+        predictions = self._refine_highres_predictions(
+            img_A_hr,
+            img_B_hr,
+            warp_AB,
+            confidence_AB,
+            warp_BA,
+            confidence_BA,
+        )
+        return self._finalize_predictions(predictions)
+
+    def _run_highres_refine_unidir(
+        self,
+        img_A_hr: torch.Tensor,
+        img_B_hr: torch.Tensor,
+        warp_AB: torch.Tensor,
+        confidence_AB: torch.Tensor,
+        warp_BA: torch.Tensor | None,
+        confidence_BA: torch.Tensor | None,
+    ) -> dict[str, torch.Tensor | None]:
+        predictions = self._refine_highres_predictions(
+            img_A_hr,
+            img_B_hr,
+            warp_AB,
+            confidence_AB,
+            None,
+            None,
+        )
+        return self._finalize_predictions(predictions)
 
     def _adjacent_descriptor_features(
         self, img_sequence_lr: torch.Tensor
@@ -540,6 +938,23 @@ class RoMaV2(nn.Module):
                 antialias=True,
             )
 
+        if getattr(self, "coarse_only", False):
+            if adjacent_sequence_lr is not None:
+                preds = self._run_adjacent_lowres(adjacent_sequence_lr)
+            else:
+                if feature_cache_keys is not None:
+                    keys_A, keys_B = feature_cache_keys
+                    descriptor_features = (
+                        self._descriptor_features(img_A_lr, keys_A),
+                        self._descriptor_features(img_B_lr, keys_B),
+                    )
+                else:
+                    descriptor_features = (self.f(img_A_lr), self.f(img_B_lr))
+                f_A, f_B = descriptor_features
+                preds = self._run_lowres_from_features(img_A_lr, img_B_lr, f_A, f_B)
+
+            return self._finalize_predictions(preds), {}
+
         # Prepare HR inputs (if settings allow)
         if self.H_hr is not None and self.W_hr is not None:
             if refine_batch is None and adjacent_sequence_like is not None:
@@ -596,6 +1011,31 @@ class RoMaV2(nn.Module):
                 self._descriptor_features(img_B_lr, keys_B),
             )
 
+        if previous_preds is None:
+            if descriptor_features is None:
+                descriptor_features = (self.f(img_A_lr), self.f(img_B_lr))
+            f_A, f_B = descriptor_features
+            if img_A_hr is None or img_B_hr is None:
+                preds = self._run_pair_lowres_from_features(img_A_lr, img_B_lr, f_A, f_B)
+            else:
+                preds = self._run_pair_lowres_highres_from_features(
+                    img_A_lr,
+                    img_B_lr,
+                    img_A_hr,
+                    img_B_hr,
+                    f_A,
+                    f_B,
+                )
+            final_preds = self._finalize_predictions(preds)
+            cache = {
+                "batch": {
+                    "img_A": img_A,
+                    "img_B": img_B,
+                    "corresps": final_preds,
+                }
+            }
+            return final_preds, cache
+
         # Call forward, injecting previous_preds if we are resuming
         preds = self(
             img_A_lr,
@@ -607,44 +1047,7 @@ class RoMaV2(nn.Module):
             adjacent_sequence_lr=adjacent_sequence_lr,
         )
 
-        # Standard RoMaV2 post-processing
-        warp_AB = preds["warp_AB"]
-        confidence_AB = preds["confidence_AB"]
-        warp_BA = preds["warp_BA"]
-        confidence_BA = preds["confidence_BA"]
-        if getattr(self, "coarse_only", False):
-            overlap_AB = confidence_AB[..., :1].sigmoid()
-            precision_AB = torch.zeros(*overlap_AB.shape[:-1], 2, 2, device=overlap_AB.device)
-            if self.bidirectional and confidence_BA is not None:
-                overlap_BA = confidence_BA[..., :1].sigmoid()
-                precision_BA = torch.zeros(*overlap_BA.shape[:-1], 2, 2, device=overlap_BA.device)
-            else:
-                overlap_BA = None
-                precision_BA = None
-        else:
-            overlap_AB, precision_AB = _map_confidence(
-                confidence=confidence_AB, threshold=self.threshold
-            )
-            if self.bidirectional:
-                overlap_BA, precision_BA = _map_confidence(
-                    confidence=confidence_BA, threshold=self.threshold
-                )
-            else:
-                overlap_BA = None
-                precision_BA = None
-
-        final_preds = {
-            "warp_AB": warp_AB.clone(),
-            "confidence_AB": confidence_AB.clone(),
-            "overlap_AB": overlap_AB.clone(),
-            "precision_AB": precision_AB.clone(),
-            "warp_BA": warp_BA.clone() if warp_BA is not None else None,
-            "confidence_BA": (
-                confidence_BA.clone() if confidence_BA is not None else None
-            ),
-            "overlap_BA": overlap_BA.clone() if overlap_BA is not None else None,
-            "precision_BA": precision_BA.clone() if precision_BA is not None else None,
-        }
+        final_preds = self._finalize_predictions(preds)
 
         # --- CACHE CREATION ---
         # Store everything needed to resume later in 'refine_batch' style

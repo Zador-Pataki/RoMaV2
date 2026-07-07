@@ -70,6 +70,21 @@ def test_descriptor_cache_returns_fresh_feature_lists():
     assert torch.all(out2[-1] < 100)
 
 
+def test_prefill_descriptor_cache_batches_future_block():
+    model = make_model()
+    images = torch.arange(4 * 3 * 4 * 4, dtype=torch.float32).reshape(4, 3, 4, 4)
+
+    model.prefill_descriptor_cache(images[:3], ["a", "b", "c"])
+
+    assert model.f.calls == 1
+    assert model.f.batch_sizes == [3]
+
+    out = model._descriptor_features(images[1:4], ["b", "c", "d"])
+    assert model.f.calls == 2
+    assert model.f.batch_sizes == [3, 1]
+    assert torch.equal(out[0][0], model._descriptor_cache[("b", 4, 4, "cpu", "torch.float32")][0])
+
+
 def test_adjacent_descriptor_features_extracts_sequence_once():
     model = make_model()
     sequence = torch.arange(5 * 3 * 4 * 4, dtype=torch.float32).reshape(5, 3, 4, 4)
