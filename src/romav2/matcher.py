@@ -91,10 +91,9 @@ class Matcher(nn.Module):
         super().__init__()
         self.cfg = cfg
         omega = 2 * torch.pi * torch.randn(cfg.dim // 2, 2)
-        self.omega = nn.Buffer(omega)
-        self.scale = nn.Buffer(torch.tensor(cfg.scale))
-
-        self.temp = nn.Buffer(torch.tensor(cfg.temp))
+        self.register_buffer("omega", omega)
+        self.register_buffer("scale", torch.tensor(cfg.scale))
+        self.register_buffer("temp", torch.tensor(cfg.temp))
         self.mv_vit = vit_from_name(
             cfg.mv_vit,
             device=device,
