@@ -91,6 +91,7 @@ class ConvRefiner(nn.Module):
     ):
         super().__init__()
         self.cfg = cfg
+        self.correlation = local_correlation
         self.proj = nn.Linear(cfg.feat_dim, cfg.proj_dim)
         hidden_dim = (
             2 * cfg.proj_dim
@@ -139,6 +140,7 @@ class ConvRefiner(nn.Module):
         prev_warp: torch.Tensor,
         prev_confidence: torch.Tensor | None,
         scale_factor: torch.Tensor,
+        projected: bool = False,
     ):
         B, H_A, W_A, _ = f_A.shape
         B, H_B, W_B, D = f_B.shape
@@ -147,16 +149,17 @@ class ConvRefiner(nn.Module):
         if prev_confidence is not None:
             prev_confidence = prev_confidence.detach()
         B, H_A, W_A, D = f_A.shape
-        assert D == self.cfg.feat_dim, (
+        assert D == (self.cfg.proj_dim if projected else self.cfg.feat_dim), (
             f"Config feature dimension {self.cfg.feat_dim=} must be the same as the input feature dimension {D=}"
         )
 
-        f_A = self.proj(f_A.reshape(B, H_A * W_A, self.cfg.feat_dim).float()).reshape(
-            B, H_A, W_A, self.cfg.proj_dim
-        )
-        f_B = self.proj(f_B.reshape(B, H_B * W_B, self.cfg.feat_dim).float()).reshape(
-            B, H_B, W_B, self.cfg.proj_dim
-        )
+        if not projected:
+            f_A = self.proj(f_A.reshape(B, H_A * W_A, self.cfg.feat_dim).float()).reshape(
+                B, H_A, W_A, self.cfg.proj_dim
+            )
+            f_B = self.proj(f_B.reshape(B, H_B * W_B, self.cfg.feat_dim).float()).reshape(
+                B, H_B, W_B, self.cfg.proj_dim
+            )
         with torch.no_grad():
             f_BA = bhwc_grid_sample(
                 f_B, prev_warp, mode=self.cfg.grid_sample_mode, align_corners=False
@@ -172,7 +175,7 @@ class ConvRefiner(nn.Module):
         f_BA_bdhw = f_BA.permute(0, 3, 1, 2)
         d = torch.cat((f_A_bdhw, f_BA_bdhw, emb_in_displacement), dim=1)
         if self.cfg.local_corr_radius is not None:
-            local_corr = local_correlation(
+            local_corr = self.correlation(
                 f_A_bdhw,
                 f_B.permute(0, 3, 1, 2),
                 local_radius=self.cfg.local_corr_radius,

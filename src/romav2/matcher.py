@@ -3,7 +3,6 @@ import torch.nn as nn
 from dataclasses import dataclass
 from typing import Literal
 from romav2.geometry import get_normalized_grid
-from einops import einsum
 from romav2.device import device
 from romav2.vit import ViTModel, vit_from_name
 from romav2.types import HeadType, MatcherStyle
@@ -17,7 +16,7 @@ def normalize(x: torch.Tensor, dim: int):
 def cosine_similarity(f_A: torch.Tensor, f_B: torch.Tensor) -> torch.Tensor:
     f_A = normalize(f_A, dim=-1)
     f_B = normalize(f_B, dim=-1)
-    res = einsum(f_A, f_B, "B H_A W_A D, B H_B W_B D -> B H_A W_A H_B W_B")
+    res = torch.einsum("abcd,aefd->abcef", f_A, f_B)
     return res
 
 
@@ -39,9 +38,7 @@ def _compute_match_embeddings(
     attn_AB = torch.softmax(attn_AB_logits, dim=2)
     attn_AB = attn_AB.reshape(B, H_A, W_A, H_B, W_B)
 
-    match_emb = einsum(
-        attn_AB, pos_emb_grid, "B H_A W_A H_B W_B, B H_B W_B D -> B H_A W_A D"
-    )
+    match_emb = torch.einsum("abcde,adef->abcf", attn_AB, pos_emb_grid)
     attn_AB_logits = attn_AB_logits.reshape(B, H_A, W_A, H_B, W_B)
     return attn_AB_logits, attn_AB, match_emb
 

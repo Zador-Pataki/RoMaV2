@@ -107,6 +107,7 @@ class RoMaV2(nn.Module):
         self.f = Descriptor(cfg.descriptor)
         self.matcher = Matcher(cfg.matcher)
         self.cfg = cfg
+        self.return_intermediates = True
         self.anchor_width = cfg.anchor_width
         self.anchor_height = cfg.anchor_height
         self.refiners = Refiners(cfg.refiners)
@@ -172,22 +173,29 @@ class RoMaV2(nn.Module):
         img_B_lr: torch.Tensor,
         img_A_hr: torch.Tensor | None = None,
         img_B_hr: torch.Tensor | None = None,
+        *,
+        features_A: tuple[torch.Tensor, ...] | None = None,
+        features_B: tuple[torch.Tensor, ...] | None = None,
+        projected: bool = False,
     ) -> dict[str, tuple[torch.Tensor, torch.Tensor] | torch.Tensor]:
         if not _highest_matmul_precision():
             raise RuntimeError("Float32 matmul precision must be set to highest")
         assert not self.training, "Currently only inference mode released"
+        assert (features_A is None) == (features_B is None)
+        assert not projected or features_A is not None
         # assumes images between [0, 1]
         # init preds
         predictions = OrderedDict()
         # extract feats
-        f_A = self.f(img_A_lr)
-        f_B = self.f(img_B_lr)
+        f_A = self.f(img_A_lr) if features_A is None else list(features_A[:2])
+        f_B = self.f(img_B_lr) if features_B is None else list(features_B[:2])
         # match feats
         matcher_output = self.matcher(
             f_A, f_B, img_A=img_A_lr, img_B=img_B_lr, bidirectional=self.bidirectional
         )
         # return matcher_output
-        predictions["matcher"] = matcher_output
+        if self.return_intermediates:
+            predictions["matcher"] = matcher_output
         warp_AB, confidence_AB = (
             matcher_output["warp_AB"],
             matcher_output["confidence_AB"],
@@ -204,19 +212,25 @@ class RoMaV2(nn.Module):
         for stage, (img_A, img_B) in enumerate(
             zip([img_A_lr, img_A_hr], [img_B_lr, img_B_hr])
         ):
-            if img_A is None or img_B is None:
-                continue
-            B, C, H, W = img_A.shape
+            if features_A is not None:
+                offset = 2 + 3 * stage
+                if offset >= len(features_A):
+                    continue
+                refiner_features_A = dict(zip((1, 2, 4), features_A[offset:offset + 3]))
+                refiner_features_B = dict(zip((1, 2, 4), features_B[offset:offset + 3]))
+                B, H, W, C = refiner_features_A[1].shape
+            else:
+                if img_A is None or img_B is None:
+                    continue
+                B, C, H, W = img_A.shape
+                refiner_features_A = self.refiner_features(img_A)
+                refiner_features_B = self.refiner_features(img_B)
             scale_factor = torch.tensor(
                 (W / self.anchor_width, H / self.anchor_height), device=device
             )
-            refiner_features_A = self.refiner_features(img_A)
-            refiner_features_B = self.refiner_features(img_B)
             for patch_size_str, refiner in self.refiners.items():
                 patch_size = int(patch_size_str)
-                zero_out_precision = (
-                    img_A_hr is not None and patch_size == 4 and stage == 1
-                )
+                zero_out_precision = patch_size == 4 and stage == 1
                 warp_AB, confidence_AB = _interpolate_warp_and_confidence(
                     warp=warp_AB,
                     confidence=confidence_AB,
@@ -243,6 +257,7 @@ class RoMaV2(nn.Module):
                     prev_warp=warp_AB,
                     prev_confidence=confidence_AB,
                     scale_factor=scale_factor,
+                    projected=projected,
                 )
                 if self.bidirectional:
                     refiner_output_BA = refiner(
@@ -251,11 +266,13 @@ class RoMaV2(nn.Module):
                         prev_warp=warp_BA,
                         prev_confidence=confidence_BA,
                         scale_factor=scale_factor,
+                        projected=projected,
                     )
                 else:
                     refiner_output_BA = None
-                predictions[f"refiner_{patch_size}_AB"] = refiner_output_AB
-                predictions[f"refiner_{patch_size}_BA"] = refiner_output_BA
+                if self.return_intermediates:
+                    predictions[f"refiner_{patch_size}_AB"] = refiner_output_AB
+                    predictions[f"refiner_{patch_size}_BA"] = refiner_output_BA
                 warp_AB, confidence_AB = (
                     refiner_output_AB["warp"],
                     refiner_output_AB["confidence"],
