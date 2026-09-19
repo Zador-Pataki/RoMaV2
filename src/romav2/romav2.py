@@ -185,7 +185,7 @@ class RoMaV2(nn.Module):
         assert not projected or features_A is not None
         # assumes images between [0, 1]
         # init preds
-        predictions = OrderedDict()
+        predictions = OrderedDict() if self.return_intermediates else {}
         # extract feats
         f_A = self.f(img_A_lr) if features_A is None else list(features_A[:2])
         f_B = self.f(img_B_lr) if features_B is None else list(features_B[:2])
