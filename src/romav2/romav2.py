@@ -29,6 +29,11 @@ from romav2.types import Setting, ImageLike
 logger = logging.getLogger(__name__)
 
 
+@torch.compiler.assume_constant_result
+def _highest_matmul_precision():
+    return torch.get_float32_matmul_precision() == "highest"
+
+
 def _interpolate_warp_and_confidence(
     *,
     warp: torch.Tensor,
@@ -168,7 +173,7 @@ class RoMaV2(nn.Module):
         img_A_hr: torch.Tensor | None = None,
         img_B_hr: torch.Tensor | None = None,
     ) -> dict[str, tuple[torch.Tensor, torch.Tensor] | torch.Tensor]:
-        if torch.get_float32_matmul_precision() != "highest":
+        if not _highest_matmul_precision():
             raise RuntimeError("Float32 matmul precision must be set to highest")
         assert not self.training, "Currently only inference mode released"
         # assumes images between [0, 1]
