@@ -11,39 +11,38 @@ import torchvision.models as models
 from torch.nn import functional as F
 
 
-def wrap_with_normalize(
-    forward: Callable[[torch.Tensor], list[torch.Tensor]],
+def normalized_forward(
+    self: nn.Module,
+    img: torch.Tensor,
     *,
+    forward: Callable[[torch.Tensor], list[torch.Tensor]],
     normalizer: Normalizer,
     patch_size: int,
     enable_amp: bool,
     frozen: bool,
     normalize_feats: bool,
-):
-    def wrapped_forward(self, img: torch.Tensor) -> list[torch.Tensor]:
-        with (
-            torch.autocast(device.type, torch.bfloat16, enabled=enable_amp),
-            torch.set_grad_enabled(not frozen),
-        ):
-            if self.training and frozen:
-                self.eval()
-            B, C, H, W = img.shape
-            assert C == 3, f"Image must have 3 channels, but got shape {img.shape=}"
-            img_n = normalizer(img)
-            H = H // patch_size
-            W = W // patch_size
-            raw_outs = forward(img_n)
-            maybe_feat_normalizer = (
-                F.normalize if normalize_feats else lambda x, dim=-1: x
+) -> list[torch.Tensor]:
+    with (
+        torch.autocast(device.type, torch.bfloat16, enabled=enable_amp),
+        torch.set_grad_enabled(not frozen),
+    ):
+        if self.training and frozen:
+            self.eval()
+        B, C, H, W = img.shape
+        assert C == 3, f"Image must have 3 channels, but got shape {img.shape=}"
+        img_n = normalizer(img)
+        H = H // patch_size
+        W = W // patch_size
+        raw_outs = forward(img_n)
+        maybe_feat_normalizer = (
+            F.normalize if normalize_feats else lambda x, dim=-1: x
+        )
+        return [
+            maybe_feat_normalizer(
+                rearrange(x, "B (H W) D -> B H W D", H=H, W=W), dim=-1
             )
-            return [
-                maybe_feat_normalizer(
-                    rearrange(x, "B (H W) D -> B H W D", H=H, W=W), dim=-1
-                )
-                for x in raw_outs
-            ]
-
-    return wrapped_forward
+            for x in raw_outs
+        ]
 
 
 def wrap_model(
@@ -62,8 +61,11 @@ def wrap_model(
         for param in model.parameters():
             param.requires_grad = False
     model.frozen = frozen
-    type(model).forward = wrap_with_normalize(
-        func,
+    # Keep the callable on the instance so model snapshots preserve the wrapper.
+    model.forward = partial(
+        normalized_forward,
+        model,
+        forward=func,
         normalizer=normalizer,
         patch_size=patch_size,
         enable_amp=enable_amp,
