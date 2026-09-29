@@ -122,6 +122,9 @@ class Matcher(nn.Module):
         bidirectional: bool,
     ):
         preds = {}
+        if device.type != "cuda":
+            f_list_A = [f.float() for f in f_list_A]
+            f_list_B = [f.float() for f in f_list_B]
         f_A = torch.cat(f_list_A, dim=-1)
         f_B = torch.cat(f_list_B, dim=-1)
         B, H_A, W_A, D_feat = f_A.shape
@@ -135,7 +138,9 @@ class Matcher(nn.Module):
         ).reshape(B, H_B, W_B, -1)
         pos_emb_grid = torch.cat((x_emb.sin(), x_emb.cos()), dim=-1)
 
-        with torch.autocast(device.type, torch.bfloat16, enabled=self.cfg.enable_amp):
+        with torch.autocast(
+            device.type, torch.bfloat16, enabled=self.cfg.enable_amp and device.type == "cuda"
+        ):
             assert self.mv_vit is not None
             f_mv_AB = self.mv_vit(torch.stack((f_A, f_B), dim=1))[
                 "x_norm_patchtokens"

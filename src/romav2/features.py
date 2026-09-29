@@ -22,7 +22,7 @@ def wrap_with_normalize(
 ):
     def wrapped_forward(self, img: torch.Tensor) -> list[torch.Tensor]:
         with (
-            torch.autocast(device.type, torch.bfloat16, enabled=enable_amp),
+            torch.autocast(device.type, torch.bfloat16, enabled=enable_amp and device.type == "cuda"),
             torch.set_grad_enabled(not frozen),
         ):
             if self.training and frozen:
@@ -56,7 +56,7 @@ def wrap_model(
     normalize_feats: bool,
     func: Any,
 ):
-    if enable_amp and frozen:  # if training we want params in fp32
+    if enable_amp and frozen and device.type == "cuda":  # if training we want params in fp32
         model = model.to(torch.bfloat16)
     if frozen:
         for param in model.parameters():
@@ -137,7 +137,7 @@ class Descriptor:
 class VGG(nn.Module):
     def forward(self, x):
         x = imagenet(x)
-        with torch.autocast(device_type="cuda", enabled=True, dtype=torch.bfloat16):
+        with torch.autocast(device_type=device.type, enabled=device.type == "cuda", dtype=torch.bfloat16):
             feats = {}
             scale = 1
             for layer in self.layers:

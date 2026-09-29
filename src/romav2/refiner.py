@@ -56,7 +56,7 @@ class Block(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.autocast(
-            device_type=device.type, enabled=self.enable_amp, dtype=torch.bfloat16
+            device_type=device.type, enabled=self.enable_amp and device.type == "cuda", dtype=torch.bfloat16
         ):
             x = self.conv_depthwise(x)
             x = self.norm(x)
