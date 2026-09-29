@@ -158,7 +158,9 @@ class DPTHead(nn.Module):
         Returns:
             Tensor or Tuple[Tensor, Tensor]: Feature maps or (predictions, confidence).
         """
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
+        ):
             assert not isinstance(aggregated_tokens_list_or_tokens, torch.Tensor), (
                 "aggregated_tokens_list_or_tokens should be a list of tensors"
             )
